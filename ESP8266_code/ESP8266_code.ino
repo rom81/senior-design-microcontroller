@@ -2,9 +2,18 @@
 #include <PubSubClient.h>
 #include <BH1750FVI.h>
 #include <Wire.h>
+#include <ArduinoJson.h>
 #include <inttypes.h>
 
+// Thresholds
 #define LUMOSITY_DELTA_THRESHOLD 50
+#define RBG_DELTA_THRESHOLD_LOW  0x3fffffff
+#define RGB_DELTA_THRESHOLD_HIGH 0xbffffffd
+
+// I2C addresses
+#define BH_I2C_ADDR  0x23 // I2C bus address of BH sensor
+#define TCS_I2C_ADDR 0x29 // I2C bus address of TCS sensor
+
 #define UUID "1fb54a9a-75ef-4962-b703-a6304be18e65"
 
 // MQTT topics
@@ -24,31 +33,60 @@ const char* password = "embedded1234";
 // MQTT server config
 const char* mqttServer = "ec2-54-158-107-32.compute-1.amazonaws.com";
 const int mqttPort = 1883;
-const char* mqttUser = "";  // currently has no username
-const char* mqttPassword = ""; // currently has no password
+const char* mqttUser = "";  // no username
+const char* mqttPassword = ""; // no password
 
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 
 BH1750FVI LightSensor(BH1750FVI::k_DevModeContLowRes);
 
+// Sensor settings
+const char* sensorName;
+boolean indoor;
+boolean emitOnChange;
+
+// Tracking current and previous lumosity values for threshold calculations
 int curr_lux, prev_lux;
+int R, G, B, C;
 
 void setup()
 {
   curr_lux = 0;
   prev_lux = 0;
-  
+  R = 0;
+  G = 0;
+  B = 0;
+  C = 0;
+
+  delay(100);
   Serial.begin(115200);
+  delay(100);
 
   // Initialize BH1750 sensor
   LightSensor.begin();
-
-  // TODO: Initialize TCS sensor
   
 
   // Connect to WiFi network
   wifi_connect();
+
+  // TODO: Initialize TCS sensor
+  Wire.begin();
+  Wire.beginTransmission(TCS_I2C_ADDR);
+  // Enable device (interrupt, wait, RGBC, and internal oscillator)
+  Wire.write(0x80); // Command to write to ENABLE register
+  Wire.write(0x1B); // This data is written to the ENABLE register to enable device
+  Wire.endTransmission(TCS_I2C_ADDR);
+  delay(200);
+
+  // Verify that TCS status says RGBC initialized
+  Wire.beginTransmission(TCS_I2C_ADDR);
+  Wire.write(0x92); // Command to read from ID register
+  Wire.endTransmission(TCS_I2C_ADDR);
+  Wire.requestFrom(TCS_I2C_ADDR, 1);
+  byte b1 = Wire.read();
+  Serial.print("First byte read: ");
+  Serial.println(b1, HEX);
   
   // Connect to MQTT broker
   client.setServer(mqttServer, mqttPort);
@@ -56,57 +94,59 @@ void setup()
 
   mqtt_connect();
 
-  // Subscribe and publish to JOIN 
+  // Subscribe to JOIN 
   if (client.subscribe(JOIN)) 
     Serial.println("Subscribed to JOIN");
-  if (client.publish(JOIN, UUID)) 
-    Serial.println("Published device UUID to JOIN");
+
+  // Publish JSON-formatted message containing UUID to JOIN
+  StaticJsonDocument<200> doc;
+  doc["uuid"] = UUID;
+  char msg[200];
+  int bytes_written = serializeJson(doc, msg);
+    
+  if (bytes_written == 0)
+  {
+    Serial.print("serializeJson() failed, bytes written: ");
+    Serial.println(bytes_written);
+  }
+  else
+  {
+    // If serialization succeeded, publish message to JOIN
+    if (client.publish(JOIN, msg)) 
+      Serial.println("Published device UUID to JOIN"); 
+  }
   
-  // Subscribe and publish to DATA 
+  // Subscribe to DATA 
   if (client.subscribe(DATA)) 
     Serial.println("Subscribed to DATA");
-//  if (client.publish(DATA, "Sensor connected")) 
-//    Serial.println("Published init message to DATA");
 
-  // Subscribe and publish to SETTINGS_SET
+  // Subscribe to SETTINGS_SET
   if (client.subscribe(SETTINGS_SET)) 
     Serial.println("Subscribed to SETTINGS_SET");
-//  if (client.publish(SETTINGS_SET, "Sensor connected")) 
-//    Serial.println("Published init message to SETTINGS_SET");
 
-  // Subscribe and publish to SETTINGS_REQUEST
+  // Subscribe to SETTINGS_REQUEST
   if (client.subscribe(SETTINGS_REQUEST)) 
     Serial.println("Subscribed to SETTINGS_REQUEST");
-//  if (client.publish(SETTINGS_REQUEST, "Sensor connected")) 
-//    Serial.println("Published init message to SETTINGS_REQUEST");
 
-  // Subscribe and publish to SETTINGS
+  // Subscribe to SETTINGS
   if (client.subscribe(SETTINGS)) 
     Serial.println("Subscribed to SETTINGS");
-//  if (client.publish(SETTINGS, "Sensor connected")) 
-//    Serial.println("Published init message to SETTINGS");
 
-  // Subscribe and publish to DATA_REQUEST
+  // Subscribe to DATA_REQUEST
   if (client.subscribe(DATA_REQUEST)) 
     Serial.println("Subscribed to DATA_REQUEST");
-//  if (client.publish(DATA_REQUEST, "Sensor connected")) 
-//    Serial.println("Published init message to DATA_REQUEST");
-
 }
 
 void loop()
 {
   curr_lux = LightSensor.GetLightIntensity();
 
-  // Significant change in light intensity, send update to server
+  // TODO: Read RGB sensor here
+
+  // Significant change in light intensity, publish update to DATA
   if (abs(curr_lux - prev_lux) >= LUMOSITY_DELTA_THRESHOLD)
   {
-    char payload[256];
-    sprintf(payload, "%d", curr_lux);
-    
-    // publish new message
-    if (client.publish(DATA, payload)) 
-      Serial.println("Published new lux reading to DATA"); 
+    publish_data(curr_lux, 0, 0, 0);
   }
   
   if (!client.loop())
@@ -116,17 +156,8 @@ void loop()
     mqtt_connect();
   }
   
-  prev_lux = curr_lux;
+  prev_lux = curr_lux;  // Update previous lux values for threshold tracking
 }
-
-//void publish_lux()
-//{
-//  int lux = LightSensor.GetLightIntensity();
-//  char payload[256];
-//  sprintf(payload, "%d", lux);
-//  if (client.publish(DATA, payload))
-//    Serial.println("Published new lux reading to DATA");
-//}
 
 void wifi_connect()
 {
@@ -168,19 +199,51 @@ void callback(const char* topic, byte* payload, unsigned int length)
   for (int i = 0; i < length; i++) Serial.print((char)payload[i]);
   Serial.println("\n-----------------------");
 
+  if (topic == JOIN)
+  {
+    Serial.println("Received acknowledgement from broker; UUID has been published");
+  }
+  
+  if (topic == SETTINGS_SET) // Deserialize message and populate sensor settings
+  {
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (error)
+    {
+      Serial.print("deserializeJson() failed: ");
+      Serial.println(error.c_str());
+    }
+    else
+    {      
+        // If deserialization succeeded, populate sensor settings from payload
+        sensorName = doc["name"];
+        indoor = doc["indoor"];
+        emitOnChange = doc["emitOnChange"];
+    }
+  }
   if (topic == SETTINGS_REQUEST)
   {
     Serial.println("Received 'SETTINGS_REQUEST");
     
-    // TODO: Read payload and adjust configuration based on received settings
+    // TODO: Publish settings data to SETTINGS topic
+    
     
   }
   if (topic == DATA_REQUEST)
   {
     Serial.println("Received DATA_REQUEST");
+    // Publish lumosity and RGB data to DATA topic
+    publish_data(LightSensor.GetLightIntensity(), 0, 0, 0);
 
-    // TODO: send data
-    
-  }
+  }  
 }
 
+void publish_data(int lux, int R, int G, int B)
+{
+  // TODO: Package data in JSON format per MQTT Ambiance topic design 
+  char payload[256];
+  sprintf(payload, "%d", lux);
+  if (!client.publish(DATA, payload))
+    Serial.println("Failed to publish new lux reading to DATA");
+}
